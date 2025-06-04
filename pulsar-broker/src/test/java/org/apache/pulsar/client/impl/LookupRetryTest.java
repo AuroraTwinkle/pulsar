@@ -191,7 +191,7 @@ public class LookupRetryTest extends MockedPulsarServiceBaseTest {
      * Client1: which has set MaxNumberOfRejectedRequestPerConnection=1, should fail on TooManyRequests
      * Client2: which has set MaxNumberOfRejectedRequestPerConnection=100, should not fail
      * on TooManyRequests, whether there is 1 or 4 (I don't do more because exponential
-     * backoff would make it take a long time.
+     * backoff would make it take a long time
      * </pre>
      *
      * @throws Exception
