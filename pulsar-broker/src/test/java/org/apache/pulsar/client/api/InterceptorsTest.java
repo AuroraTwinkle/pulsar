@@ -18,12 +18,14 @@
  */
 package org.apache.pulsar.client.api;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
+import io.netty.buffer.ByteBuf;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -33,6 +35,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -41,6 +44,8 @@ import lombok.Cleanup;
 import lombok.CustomLog;
 import org.apache.pulsar.broker.service.SharedPulsarBaseTest;
 import org.apache.pulsar.client.admin.PulsarAdminException;
+import org.apache.pulsar.client.impl.BatchMessageIdImpl;
+import org.apache.pulsar.client.impl.ChunkMessageIdImpl;
 import org.apache.pulsar.client.impl.MessageImpl;
 import org.apache.pulsar.client.impl.TopicMessageImpl;
 import org.apache.pulsar.common.api.proto.KeyValue;
@@ -255,6 +260,96 @@ public class InterceptorsTest extends SharedPulsarBaseTest {
                 "Message data should be available in onSendAcknowledgement");
         Assert.assertEquals(messageDataOnSendAcknowledgement.get(0), messageValue,
                 "Message data should be available in onSendAcknowledgement");
+    }
+
+    private enum ProducerSendMode {
+        UNBATCHED, SINGLE_MESSAGE_BATCH, MULTI_MESSAGE_BATCH, DELAYED, CHUNKED
+    }
+
+    @DataProvider
+    public Object[][] producerInterceptorSendModes() {
+        List<Object[]> cases = new ArrayList<>();
+        for (ProducerSendMode mode : ProducerSendMode.values()) {
+            for (CompressionType compression : CompressionType.values()) {
+                cases.add(new Object[] {mode, compression});
+            }
+        }
+        return cases.toArray(new Object[0][]);
+    }
+
+    @Test(dataProvider = "producerInterceptorSendModes", timeOut = 60000)
+    @SuppressWarnings("deprecation")
+    public void testProducerInterceptorAccessMessageValue(ProducerSendMode mode, CompressionType compression)
+            throws Exception {
+        String topic = newTopicName();
+        List<String> beforeSendValues = new ArrayList<>();
+        List<ByteBuf> payloads = new ArrayList<>();
+        Map<MessageId, List<String>> acknowledgedValues = new ConcurrentHashMap<>();
+        ProducerInterceptor<String> interceptor = new ProducerInterceptor<>() {
+            @Override
+            public void close() {
+            }
+
+            @Override
+            public Message<String> beforeSend(Producer<String> producer, Message<String> message) {
+                beforeSendValues.add(message.getValue());
+                payloads.add(((MessageImpl<?>) message).getDataBuffer());
+                return message;
+            }
+
+            @Override
+            public void onSendAcknowledgement(Producer<String> producer, Message<String> message, MessageId msgId,
+                                              Throwable exception) {
+                acknowledgedValues.put(msgId, List.of(message.getValue(), message.getValue()));
+            }
+        };
+        boolean batching = mode != ProducerSendMode.UNBATCHED && mode != ProducerSendMode.CHUNKED;
+        try (Consumer<String> consumer = pulsarClient.newConsumer(Schema.STRING)
+                     .topic(topic).subscriptionName("sub").subscribe();
+             Producer<String> producer = pulsarClient.newProducer(Schema.STRING)
+                     .topic(topic)
+                     .intercept(interceptor)
+                     .enableBatching(batching)
+                     .batchingMaxPublishDelay(1, TimeUnit.DAYS)
+                     .batchingMaxMessages(2)
+                     .enableChunking(mode == ProducerSendMode.CHUNKED)
+                     .chunkMaxMessageSize(16)
+                     .compressionType(compression)
+                     .create()) {
+            int messageCount = mode == ProducerSendMode.SINGLE_MESSAGE_BATCH ? 1 : 2;
+            List<String> expectedValues = new ArrayList<>();
+            List<CompletableFuture<MessageId>> sends = new ArrayList<>();
+            for (int i = 0; i < messageCount; i++) {
+                String value = UUID.randomUUID() + "-" + i;
+                expectedValues.add(value);
+                TypedMessageBuilder<String> message = producer.newMessage().value(value);
+                if (mode == ProducerSendMode.DELAYED) {
+                    // A deliver-at timestamp bypasses batching even when the message is already due.
+                    message.deliverAt(System.currentTimeMillis());
+                }
+                sends.add(mode == ProducerSendMode.SINGLE_MESSAGE_BATCH
+                        ? CompletableFuture.completedFuture(message.send()) : message.sendAsync());
+            }
+            producer.flush();
+            assertThat(beforeSendValues).containsExactlyElementsOf(expectedValues);
+            for (int i = 0; i < messageCount; i++) {
+                MessageId messageId = sends.get(i).get(10, TimeUnit.SECONDS);
+                if (mode == ProducerSendMode.MULTI_MESSAGE_BATCH) {
+                    assertThat(messageId).isInstanceOf(BatchMessageIdImpl.class);
+                } else if (mode == ProducerSendMode.CHUNKED) {
+                    assertThat(messageId).isInstanceOf(ChunkMessageIdImpl.class);
+                }
+                String expected = expectedValues.get(i);
+                assertThat(acknowledgedValues).containsEntry(messageId, List.of(expected, expected));
+                Message<String> received = consumer.receive(10, TimeUnit.SECONDS);
+                assertThat(received).isNotNull();
+                assertThat(received.getValue()).isEqualTo(expected);
+                consumer.acknowledge(received);
+            }
+            assertThat(acknowledgedValues).hasSize(messageCount);
+            Awaitility.await().untilAsserted(() ->
+                    assertThat(payloads).allSatisfy(payload -> assertThat(payload.refCnt()).isZero()));
+        }
     }
 
     @Test
